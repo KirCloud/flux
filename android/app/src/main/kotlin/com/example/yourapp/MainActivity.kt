@@ -1,4 +1,4 @@
-package com.flux.app.flux
+package com.example.yourapp
 
 import android.content.Intent
 import android.net.VpnService
