@@ -118,6 +118,56 @@ class ServerNode {
              'sni': config['sni'] ?? config['peer'],
            },
          );
+      case 'wireguard':
+         final privateKey = config['private-key'] as String? ?? config['privateKey'] as String? ?? '';
+         final publicKey = config['public-key'] as String? ?? config['publicKey'] as String? ?? '';
+         final reserved = config['reserved'];
+         final mtu = config['mtu'] as int? ?? 1420;
+         final ip = config['ip'] as String? ?? config['address'] as String? ?? '10.0.0.1/32';
+         
+         return ServerNode(
+           name: name,
+           address: server,
+           port: port,
+           protocol: 'wireguard',
+           uuid: privateKey,
+           rawConfig: {
+             ...config,
+             'privateKey': privateKey,
+             'secretKey': privateKey,
+             'publicKey': publicKey,
+             'endpoint': '$server:$port',
+             'address': ip,
+             'mtu': mtu,
+             if (reserved != null) 'reserved': reserved is List ? reserved : null,
+           },
+         );
+      case 'tuic':
+         final uuid = config['uuid'] as String? ?? '';
+         final password = config['password'] as String? ?? config['token'] as String? ?? '';
+         final congestionControl = config['congestion-controller'] as String? ?? 
+                                   config['congestion_control'] as String? ?? 'cubic';
+         final udpRelayMode = config['udp-relay-mode'] as String? ?? 
+                              config['udp_relay_mode'] as String? ?? 'native';
+         final alpn = config['alpn'];
+         final sni = config['sni'] as String? ?? server;
+         
+         return ServerNode(
+           name: name,
+           address: server,
+           port: port,
+           protocol: 'tuic',
+           uuid: uuid,
+           rawConfig: {
+             ...config,
+             'uuid': uuid,
+             'password': password,
+             'congestion_control': congestionControl,
+             'udp_relay_mode': udpRelayMode,
+             'sni': sni,
+             if (alpn != null) 'alpn': alpn is List ? alpn.join(',') : alpn,
+           },
+         );
       default:
         // 不支持的协议类型
         return ServerNode(
@@ -386,6 +436,106 @@ class ServerNode {
     }
   }
 
+  /// 从 WireGuard 链接解析
+  /// 格式: wireguard://privateKey@endpoint:port?publicKey=xxx&address=10.0.0.1/32&mtu=1420&reserved=1,2,3#名称
+  /// 或: wg://...
+  static ServerNode? fromWireGuard(String link) {
+    try {
+      if (!link.startsWith('wireguard://') && !link.startsWith('wg://')) {
+        return null;
+      }
+
+      final uri = Uri.parse(link);
+      final query = uri.queryParameters;
+      
+      final privateKey = uri.userInfo;
+      final endpoint = uri.host;
+      final port = uri.port > 0 ? uri.port : 51820;
+      
+      final publicKey = query['publicKey'] ?? query['public_key'] ?? query['peer'];
+      final address = query['address'] ?? query['ip'] ?? '10.0.0.1/32';
+      final mtu = int.tryParse(query['mtu'] ?? '1420') ?? 1420;
+      
+      // reserved 可能是 "1,2,3" 格式
+      List<int>? reserved;
+      final reservedStr = query['reserved'];
+      if (reservedStr != null && reservedStr.isNotEmpty) {
+        reserved = reservedStr.split(',').map((e) => int.tryParse(e.trim()) ?? 0).toList();
+      }
+
+      return ServerNode(
+        name: _decodeNodeName(uri.fragment, fallback: 'WireGuard'),
+        address: endpoint,
+        port: port,
+        protocol: 'wireguard',
+        uuid: privateKey, // 用 uuid 存储 privateKey
+        rawConfig: {
+          'privateKey': privateKey,
+          'secretKey': privateKey,
+          'publicKey': publicKey,
+          'endpoint': '$endpoint:$port',
+          'address': address,
+          'mtu': mtu,
+          if (reserved != null) 'reserved': reserved,
+          if (query['allowedIPs'] != null) 'allowedIPs': query['allowedIPs'],
+          if (query['keepAlive'] != null) 'keepAlive': int.tryParse(query['keepAlive']!) ?? 0,
+        },
+      );
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /// 从 TUIC 链接解析
+  /// 格式: tuic://uuid:password@host:port?congestion_control=cubic&alpn=h3&sni=example.com&udp_relay_mode=native#名称
+  static ServerNode? fromTuic(String link) {
+    try {
+      if (!link.startsWith('tuic://')) {
+        return null;
+      }
+
+      final uri = Uri.parse(link);
+      final query = uri.queryParameters;
+      
+      // userInfo 格式: uuid:password
+      final userInfoParts = uri.userInfo.split(':');
+      final uuid = userInfoParts.isNotEmpty ? userInfoParts[0] : '';
+      final password = userInfoParts.length > 1 ? userInfoParts.sublist(1).join(':') : '';
+      
+      final server = uri.host;
+      final port = uri.port > 0 ? uri.port : 443;
+      
+      final congestionControl = query['congestion_control'] ?? query['cc'] ?? 'cubic';
+      final alpn = query['alpn'] ?? 'h3';
+      final sni = query['sni'] ?? query['peer'] ?? server;
+      final udpRelayMode = query['udp_relay_mode'] ?? query['udp'] ?? 'native';
+      final allowInsecure = _parseBool(query['allow_insecure'] ?? query['insecure'] ?? query['allowInsecure']);
+      final disableSni = _parseBool(query['disable_sni']);
+
+      return ServerNode(
+        name: _decodeNodeName(uri.fragment, fallback: 'TUIC'),
+        address: server,
+        port: port,
+        protocol: 'tuic',
+        uuid: uuid,
+        rawConfig: {
+          'uuid': uuid,
+          'password': password,
+          'server': server,
+          'port': port,
+          'congestion_control': congestionControl,
+          'alpn': alpn,
+          'sni': sni,
+          'udp_relay_mode': udpRelayMode,
+          if (allowInsecure != null) 'allowInsecure': allowInsecure,
+          if (disableSni != null) 'disable_sni': disableSni,
+        },
+      );
+    } catch (e) {
+      return null;
+    }
+  }
+
   /// 智能解析订阅内容
   static List<ServerNode> parseFromContent(String content) {
     if (content.isEmpty) return [];
@@ -428,6 +578,12 @@ class ServerNode {
           if (node != null) nodes.add(node);
         } else if (line.startsWith('hysteria2://') || line.startsWith('hy2://')) {
            final node = ServerNode.fromHysteria2(line);
+           if (node != null) nodes.add(node);
+        } else if (line.startsWith('wireguard://') || line.startsWith('wg://')) {
+           final node = ServerNode.fromWireGuard(line);
+           if (node != null) nodes.add(node);
+        } else if (line.startsWith('tuic://')) {
+           final node = ServerNode.fromTuic(line);
            if (node != null) nodes.add(node);
         }
       } catch (_) {
@@ -676,6 +832,79 @@ class ServerNode {
           if (skipCertVerify) 'allowInsecure': true,
         };
       }
+      
+      outbound['streamSettings'] = streamSettings;
+      return outbound;
+    } else if (protocol == 'wireguard') {
+      // WireGuard 协议配置
+      final secretKey = rawConfig?['secretKey'] ?? rawConfig?['privateKey'] ?? uuid ?? '';
+      final publicKey = rawConfig?['publicKey'] ?? '';
+      final addressList = <String>[];
+      final addrConfig = rawConfig?['address'];
+      if (addrConfig is String) {
+        addressList.add(addrConfig);
+      } else if (addrConfig is List) {
+        addressList.addAll(addrConfig.map((e) => e.toString()));
+      } else {
+        addressList.add('10.0.0.1/32');
+      }
+      
+      final mtu = rawConfig?['mtu'] as int? ?? 1420;
+      final reserved = rawConfig?['reserved'];
+      final keepAlive = rawConfig?['keepAlive'] as int? ?? 0;
+      
+      final outbound = <String, dynamic>{
+        'protocol': 'wireguard',
+        'settings': {
+          'secretKey': secretKey,
+          'address': addressList,
+          'peers': [
+            {
+              'endpoint': '$address:$port',
+              'publicKey': publicKey,
+              if (keepAlive > 0) 'keepAlive': keepAlive,
+            }
+          ],
+          'mtu': mtu,
+          if (reserved is List) 'reserved': reserved,
+        },
+      };
+      return outbound;
+    } else if (protocol == 'tuic') {
+      // TUIC 协议配置
+      final tuicUuid = rawConfig?['uuid'] ?? uuid ?? '';
+      final password = rawConfig?['password'] ?? '';
+      final congestionControl = rawConfig?['congestion_control'] ?? 'cubic';
+      final udpRelayMode = rawConfig?['udp_relay_mode'] ?? 'native';
+      final sni = rawConfig?['sni'] as String? ?? address;
+      final alpnStr = rawConfig?['alpn'] as String? ?? 'h3';
+      final alpn = alpnStr.split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+      final allowInsecure = rawConfig?['allowInsecure'] == true;
+      
+      final outbound = <String, dynamic>{
+        'protocol': 'tuic',
+        'settings': {
+          'servers': [
+            {
+              'address': address,
+              'port': port,
+              'uuid': tuicUuid,
+              'password': password,
+              'congestion_control': congestionControl,
+              'udp_relay_mode': udpRelayMode,
+            }
+          ]
+        },
+      };
+      
+      final streamSettings = <String, dynamic>{
+        'security': 'tls',
+        'tlsSettings': {
+          'serverName': sni,
+          'alpn': alpn,
+          if (allowInsecure) 'allowInsecure': true,
+        },
+      };
       
       outbound['streamSettings'] = streamSettings;
       return outbound;
